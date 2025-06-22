@@ -47,6 +47,7 @@ typedef struct _harmosc {
     char all_on;                // All harmonics active
     char odd_only;              // Only odd harmonics
     char even_only;             // Only even harmonics
+    char custom_amps;           // Using custom amplitude values
 } t_harmosc;
 
 // Function prototypes
@@ -63,6 +64,7 @@ void harmosc_detune(t_harmosc *x, double d);
 void harmosc_all(t_harmosc *x);
 void harmosc_odd(t_harmosc *x);
 void harmosc_even(t_harmosc *x);
+void harmosc_amps(t_harmosc *x, t_symbol *s, long argc, t_atom *argv);
 
 // Internal functions
 void harmosc_build_sine_table(t_harmosc *x);
@@ -89,6 +91,7 @@ void ext_main(void *r) {
     class_addmethod(c, (method)harmosc_all, "all", 0);
     class_addmethod(c, (method)harmosc_odd, "odd", 0);
     class_addmethod(c, (method)harmosc_even, "even", 0);
+    class_addmethod(c, (method)harmosc_amps, "amps", A_GIMME, 0);
     
     class_dspinit(c);
     class_register(CLASS_BOX, c);
@@ -140,6 +143,7 @@ void *harmosc_new(t_symbol *s, long argc, t_atom *argv) {
         x->all_on = 1;
         x->odd_only = 0;
         x->even_only = 0;
+        x->custom_amps = 0;
         
         // Allocate arrays
         x->amplitudes = (double *)sysmem_newptr(x->num_harmonics * sizeof(double));
@@ -193,7 +197,7 @@ void harmosc_free(t_harmosc *x) {
 
 void harmosc_assist(t_harmosc *x, void *b, long m, long a, char *s) {
     if (m == ASSIST_INLET) {
-        sprintf(s, "(float) Frequency in Hz");
+        sprintf(s, "(float) Frequency in Hz\n(amps) Custom amplitude list\n(falloff) Falloff parameter\n(detune) Detune amount\n(all/odd/even) Harmonic selection");
     } else {
         sprintf(s, "(signal) Harmonic oscillator output");
     }
@@ -241,6 +245,23 @@ void harmosc_update_phase_increments(t_harmosc *x) {
 
 void harmosc_calculate_amplitudes(t_harmosc *x) {
     double total = 0.0;
+    
+    // Skip automatic calculation if using custom amplitudes
+    if (x->custom_amps) {
+        // Just apply harmonic states and normalize
+        for (int i = 0; i < x->num_harmonics; i++) {
+            x->amplitudes[i] *= x->harmonic_states[i];
+            total += x->amplitudes[i];
+        }
+        
+        // Normalize to maintain consistent output level
+        if (total > 0.0) {
+            for (int i = 0; i < x->num_harmonics; i++) {
+                x->amplitudes[i] /= total;
+            }
+        }
+        return;
+    }
     
     // Calculate amplitudes with bipolar falloff behavior
     // -1.0 = only fundamental, 0.0 = equal harmonics, +1.0 = only highest harmonic
@@ -334,6 +355,7 @@ void harmosc_perform64(t_harmosc *x, t_object *dsp64, double **ins, long numins,
 // Message handlers
 void harmosc_falloff(t_harmosc *x, double f) {
     x->falloff = CLAMP(f, -1.0, 1.0);
+    x->custom_amps = 0;  // Clear custom amplitudes when using falloff
     harmosc_calculate_amplitudes(x);
     post("harmosc~: falloff set to %.3f", x->falloff);
 }
@@ -415,4 +437,53 @@ void harmosc_generate_detune_offsets(t_harmosc *x) {
             post("harmosc~: harmonic %d detune offset: %.1f cents", i+1, x->detune_offsets[i]);
         }
     }
+}
+
+void harmosc_amps(t_harmosc *x, t_symbol *s, long argc, t_atom *argv) {
+    if (argc == 0) {
+        object_error((t_object *)x, "amps: requires at least one amplitude value");
+        return;
+    }
+    
+    // Set custom amplitudes flag
+    x->custom_amps = 1;
+    
+    // Clear state flags since we're using custom amplitudes
+    x->all_on = 0;
+    x->odd_only = 0;
+    x->even_only = 0;
+    
+    // Process each amplitude value
+    int num_values = MIN(argc, x->num_harmonics);
+    for (int i = 0; i < num_values; i++) {
+        double amp_value = 0.0;
+        
+        // Extract amplitude value from atom
+        if (atom_gettype(argv + i) == A_FLOAT) {
+            amp_value = atom_getfloat(argv + i);
+        } else if (atom_gettype(argv + i) == A_LONG) {
+            amp_value = (double)atom_getlong(argv + i);
+        } else {
+            object_error((t_object *)x, "amps: argument %d is not a number", i + 1);
+            continue;
+        }
+        
+        // Clamp amplitude to 0-1 range
+        amp_value = CLAMP(amp_value, 0.0, 1.0);
+        x->amplitudes[i] = amp_value;
+        
+        // Set harmonic state based on amplitude (0 = off, >0 = on)
+        x->harmonic_states[i] = (amp_value > 0.0) ? 1 : 0;
+    }
+    
+    // Set remaining harmonics to 0 if fewer values provided than harmonics
+    for (int i = num_values; i < x->num_harmonics; i++) {
+        x->amplitudes[i] = 0.0;
+        x->harmonic_states[i] = 0;
+    }
+    
+    // Apply normalization via calculate_amplitudes (but skip the automatic calculation)
+    harmosc_calculate_amplitudes(x);
+    
+    post("harmosc~: custom amplitudes set for %d harmonics", num_values);
 }
