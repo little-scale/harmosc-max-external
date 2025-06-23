@@ -25,9 +25,16 @@ typedef struct _harmosc {
     
     // Oscillator state
     double phase;               // Master phase accumulator (0-1)
-    double freq;                // Fundamental frequency
     double sr;                  // Sample rate
     double sr_recip;            // 1/sr for efficiency
+    
+    // lores~ pattern: signal connection status
+    short freq_has_signal;      // 1 if frequency inlet has signal connection
+    short falloff_has_signal;   // 1 if falloff inlet has signal connection
+    
+    // Float parameters (stored values for when no signal connected)
+    double freq_float;          // Fundamental frequency
+    double falloff_float;       // Falloff parameter (-1 to 1)
     
     // Harmonic control
     int num_harmonics;          // Total number of harmonics
@@ -102,19 +109,25 @@ void *harmosc_new(t_symbol *s, long argc, t_atom *argv) {
     t_harmosc *x = (t_harmosc *)object_alloc(harmosc_class);
     
     if (x) {
-        dsp_setup((t_pxobject *)x, 0);  // No signal inlets
-        outlet_new(x, "signal");         // One signal outlet
+        // lores~ pattern: 2 signal inlets (frequency, falloff)
+        dsp_setup((t_pxobject *)x, 2);
+        outlet_new(x, "signal");
         
         // Parse arguments: [fundamental freq] [n harmonics] [falloff] [detune]
         x->num_harmonics = 8;   // Default
-        x->freq = 440.0;        // Default  
+        x->freq_float = 440.0;  // Default  
         x->falloff = 0.0;       // Default
+        x->falloff_float = 0.0; // Default
         x->detune = 0.0;        // Default
+        
+        // Initialize connection status (assume no signals connected initially)
+        x->freq_has_signal = 0;
+        x->falloff_has_signal = 0;
         
         // Argument 1: Fundamental frequency
         if (argc >= 1 && (atom_gettype(argv) == A_FLOAT || atom_gettype(argv) == A_LONG)) {
             double freq_arg = atom_gettype(argv) == A_FLOAT ? atom_getfloat(argv) : (double)atom_getlong(argv);
-            x->freq = CLAMP(freq_arg, 0.1, 20000.0);
+            x->freq_float = CLAMP(freq_arg, 0.1, 20000.0);
         }
         
         // Argument 2: Number of harmonics
@@ -125,7 +138,7 @@ void *harmosc_new(t_symbol *s, long argc, t_atom *argv) {
         // Argument 3: Falloff
         if (argc >= 3 && (atom_gettype(argv + 2) == A_FLOAT || atom_gettype(argv + 2) == A_LONG)) {
             double falloff_arg = atom_gettype(argv + 2) == A_FLOAT ? atom_getfloat(argv + 2) : (double)atom_getlong(argv + 2);
-            x->falloff = CLAMP(falloff_arg, -1.0, 1.0);
+            x->falloff = x->falloff_float = CLAMP(falloff_arg, -1.0, 1.0);
         }
         
         // Argument 4: Detune
@@ -170,7 +183,7 @@ void *harmosc_new(t_symbol *s, long argc, t_atom *argv) {
         harmosc_calculate_amplitudes(x);
         
         post("harmosc~: Created with %.1f Hz, %d harmonics, falloff %.2f, detune %.2f", 
-             x->freq, x->num_harmonics, x->falloff, x->detune);
+             x->freq_float, x->num_harmonics, x->falloff_float, x->detune);
     }
     
     return x;
@@ -197,16 +210,35 @@ void harmosc_free(t_harmosc *x) {
 
 void harmosc_assist(t_harmosc *x, void *b, long m, long a, char *s) {
     if (m == ASSIST_INLET) {
-        sprintf(s, "(float) Frequency in Hz\n(amps) Custom amplitude list\n(falloff) Falloff parameter\n(detune) Detune amount\n(all/odd/even) Harmonic selection");
+        switch (a) {
+            case 0:
+                sprintf(s, "(signal/float) Frequency in Hz");
+                break;
+            case 1:
+                sprintf(s, "(signal/float) Falloff (-1 to 1)");
+                break;
+        }
     } else {
         sprintf(s, "(signal) Harmonic oscillator output");
     }
 }
 
 void harmosc_float(t_harmosc *x, double f) {
-    // Frequency input
-    x->freq = CLAMP(f, 0.1, 20000.0);
-    harmosc_update_phase_increments(x);
+    // lores~ pattern: proxy_getinlet works on signal inlets for float routing
+    long inlet = proxy_getinlet((t_object *)x);
+    
+    switch (inlet) {
+        case 0: // Frequency inlet
+            x->freq_float = CLAMP(f, 0.1, 20000.0);
+            harmosc_update_phase_increments(x);
+            break;
+        case 1: // Falloff inlet
+            x->falloff_float = CLAMP(f, -1.0, 1.0);
+            x->falloff = x->falloff_float;
+            x->custom_amps = 0;  // Clear custom amplitudes when using falloff
+            harmosc_calculate_amplitudes(x);
+            break;
+    }
 }
 
 void harmosc_build_sine_table(t_harmosc *x) {
@@ -225,7 +257,7 @@ void harmosc_build_sine_table(t_harmosc *x) {
 }
 
 void harmosc_update_phase_increments(t_harmosc *x) {
-    double base_increment = x->freq * x->sr_recip;
+    double base_increment = x->freq_float * x->sr_recip;
     
     for (int i = 0; i < x->num_harmonics; i++) {
         double harmonic_frequency = i + 1;  // Base harmonic number (1, 2, 3, ...)
@@ -315,26 +347,61 @@ void harmosc_dsp64(t_harmosc *x, t_object *dsp64, short *count, double samplerat
         harmosc_update_phase_increments(x);
     }
     
+    // lores~ pattern: store signal connection status
+    x->freq_has_signal = count[0];
+    x->falloff_has_signal = count[1];
+    
     object_method(dsp64, gensym("dsp_add64"), x, harmosc_perform64, 0, NULL);
 }
 
 void harmosc_perform64(t_harmosc *x, t_object *dsp64, double **ins, long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam) {
+    // Input buffers for frequency and falloff inlets
+    double *freq_in = ins[0];
+    double *falloff_in = ins[1];
     double *out = outs[0];
     double phase = x->phase;
     double *sine_table = x->sine_table;
     int table_mask = x->table_mask;
-    double base_increment = x->phase_increments[0];
     
     // Process audio block
     for (long i = 0; i < sampleframes; i++) {
+        // lores~ pattern: choose signal vs float for each inlet
+        double current_freq = x->freq_has_signal ? freq_in[i] : x->freq_float;
+        double current_falloff = x->falloff_has_signal ? falloff_in[i] : x->falloff_float;
+        
+        // Clamp falloff parameter
+        current_falloff = CLAMP(current_falloff, -1.0, 1.0);
+        
+        // Update falloff if it changed (for signal-rate modulation)
+        if (current_falloff != x->falloff) {
+            x->falloff = current_falloff;
+            // Only recalculate if not using custom amplitudes
+            if (!x->custom_amps) {
+                harmosc_calculate_amplitudes(x);
+            }
+        }
+        
+        double base_increment = current_freq * x->sr_recip;
+        
         double sample = 0.0;
         
         // Additive synthesis loop - uses individual phase increments for detuning
         for (int h = 0; h < x->num_harmonics; h++) {
             if (x->amplitudes[h] > 0.0) {
-                // Use individual phase increment ratio for detuning
-                double phase_ratio = x->phase_increments[h] / base_increment;
+                // Calculate harmonic frequency with detuning
+                double harmonic_frequency = h + 1;  // Base harmonic number (1, 2, 3, ...)
+                
+                if (x->detune > 0.0) {
+                    // Apply detune: 0.0 = harmonic, 1.0 = ±50 cents maximum
+                    double cents_offset = x->detune_offsets[h] * x->detune;
+                    double frequency_ratio = pow(2.0, cents_offset / 1200.0);
+                    harmonic_frequency *= frequency_ratio;
+                }
+                
+                double harmonic_increment = base_increment * harmonic_frequency;
+                double phase_ratio = harmonic_increment / base_increment;
                 double harmonic_phase = phase * phase_ratio;
+                
                 // Wrap phase to 0-1 range
                 harmonic_phase = harmonic_phase - floor(harmonic_phase);
                 int table_index = (int)(harmonic_phase * TABLE_SIZE) & table_mask;
